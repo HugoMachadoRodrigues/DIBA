@@ -1,0 +1,331 @@
+---
+title: "Multioutput regression"
+author: "Hugo"
+date: "11/05/2021"
+output: rmarkdown::github_document
+# output: word_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+require("knitr")
+knitr::opts_chunk$set(echo = TRUE)
+# knitr::opts_knit$set("D:/OneDrive/EMBRAPA/Pronasolos/Atividades/ML/ml/data/")
+# getwd()
+
+```
+
+# Entendendo o problema
+
+-   A *Simple regression* model is one that attempts to fit a linear regression model with a single explanatory/independent variable.
+
+-   *Multiple regression* model is one that attempts to predict a dependent variable which is based on the value of two or more independent variables. Example: can daily cigarette consumption be predicted based on smoking duration, age when started smoking, income, gender etc.
+
+-   *Multi target regression* is the term used when there are multiple dependent variables. If the target variables are categorical, then it is called multi-label or multi-target classification, and if the target variables are numeric, then **multi-target (or multi-output) regression** is the name commonly used.
+
+Um bom artigo sobre revisão de multi-target regression com vários métodos e resultados pode ser encontrado aqui: <http://cig.fi.upm.es/articles/2015/Borchani-2015-WDMKD.pdf>
+
+### Carregando pacotes
+
+```{r message=FALSE}
+# library(devtools)
+# install_bitbucket("brendo1001/ithir/pkg")
+
+# install.packages(c("sp","parallel","MASS","e1071","sp","parallel","MASS","e1071","neuralnet","pls","gam","tripack","ithir","plsdepot","randomForest","raster","magrittr","rgdal","leaflet","plotKML","htmlwidgets","dplyr","glmnet","ggplot2","caret","rpart","doParallel"))
+
+pacotes<-c("sp","parallel","MASS","e1071","neuralnet","pls","gam","tripack","ithir","plsdepot","randomForest","raster","magrittr","rgdal","leaflet","plotKML","htmlwidgets","dplyr","glmnet","ggplot2","caret","rpart","doParallel")
+
+lapply(pacotes, require, character.only = TRUE)
+```
+
+### Carregando dados
+
+```{r}
+setwd("D:/OneDrive/EMBRAPA/Pronasolos/Atividades/Publicações/4_diba/diba/data/")
+
+crs<-"+proj=utm +zone=24 +south +datum=WGS84 +units=m +no_defs +ellps=WGS84 +towgs84=0,0,0 "
+contorno <- rgdal::readOGR("./contorno_novo.shp")
+area_10<-read.asciigrid("./boundary_10.asc",as.image=F,plot.image=T)
+plot(area_10)
+
+dados_train<-read.table(file="data_ce_lab_pss.csv", header=T, sep=",", dec=".", stringsAsFactors=T)
+
+dados_valid<-read.table(file="data_ce_lab_pss_valid.csv", header=T, sep=",", dec=".", stringsAsFactors=T)
+
+covariates <- stackOpen("stack_sensor_em38.stk")
+names(covariates)<- c("CE_1_m","CE_0_5_m","SM_1_m","SM_0_5_m")
+plot(covariates)
+
+```
+
+## Teste 1 - Sensores proximais como covariáveis
+
+### Redes Neurais
+
+```{r}
+
+normalize = function(x){return((x-min(x))/(max(x)-min(x)))
+}
+
+ce_train_norm=as.data.frame(lapply(dados_train[c(4:6,10:13)], normalize))
+ce_valid_norm=as.data.frame(lapply(dados_valid[c(4:6,10:13)], normalize))
+
+ce_model_NN = neuralnet(CE_0_10+CE_10_30+CE_30_50 ~  CE_1_m+CE_0_5_m+SM_1_m+SM_0_5_m, data=ce_train_norm, hidden = c(5,3) )
+
+summary(ce_model_NN)
+plot(ce_model_NN)
+
+model_results_NN=neuralnet::compute(ce_model_NN,ce_valid_norm[,c(4:7)])
+
+predicted_NN=model_results_NN$net.result
+
+cor(predicted_NN,ce_valid_norm[,c(4:7)])
+
+# Model Prediction
+x_hat_pre_neural_net <- predict(model_results_NN, ce_train_norm)
+x_hat_pre_neural_net
+  
+# Multiple R-squared
+rsq_neuralnet <- cor(ce_train_norm, x_hat_pre_neural_net)^2
+rsq_neuralnet
+  
+# Plot
+plot(ce_model_NN, main = "Neural net Regression")
+
+```
+
+### glmnet
+
+```{r}
+# X and Y datasets
+X <- ce_train_norm %>% 
+     select(CE_0_10,CE_10_30,CE_30_50) %>% 
+     scale(center = TRUE, scale = FALSE) %>% 
+     as.matrix()
+
+Y <-ce_train_norm %>% 
+    select(CE_1_m,CE_0_5_m,SM_1_m,SM_0_5_m) %>% 
+    as.matrix()
+  
+# Model Building : Elastic Net Regression
+control <- trainControl(method = "repeatedcv",
+                              number = 5,
+                              repeats = 5,
+                              search = "random",
+                              verboseIter = TRUE)
+  
+# Training ELastic Net Regression model
+elastic_model_glmnet <- train(CE_0_10+CE_10_30+CE_30_50 ~ .,
+                           data = cbind(X, Y),
+                           method = "glmnet",
+                           preProcess = c("center", "scale"),
+                           tuneLength = 25,
+                           trControl = control)
+
+# Model Prediction
+x_hat_pre_glmnet <- predict(elastic_model_glmnet, Y)
+x_hat_pre_glmnet
+  
+# Multiple R-squared
+rsq_glmnet <- cor(X, x_hat_pre_glmnet)^2
+rsq_glmnet
+  
+# Plot
+plot(elastic_model_glmnet, main = "Elastic Net Regression")
+
+map_NN<-predict(covariates,elastic_model_glmnet)
+plot(map_NN)
+
+```
+
+### Knn_1
+
+```{r}
+elastic_model_knn_1 <- train(CE_0_10+CE_10_30+CE_30_50 ~ .,
+                           data = cbind(X, Y),
+                           method = "knn",
+                           preProcess = c("center", "scale"),
+                           tuneLength = 25,
+                           trControl = trainControl(method = "boot"))
+# Model Prediction
+x_hat_pre_knn_1 <- predict(elastic_model_knn_1, Y)
+x_hat_pre_knn_1
+  
+# Multiple R-squared
+rsq_knn_1 <- cor(X, x_hat_pre_knn_1)^2
+rsq_knn_1
+  
+# Plot
+plot(elastic_model_knn_1, main = "Knn1 Regression")
+
+map_knn1<-predict(covariates,elastic_model_knn_1)
+plot(map_knn1)
+
+```
+
+### Knn_2
+
+```{r}
+elastic_model_knn_2 <- train(CE_0_10+CE_10_30+CE_30_50~ .,
+                           data = cbind(X, Y),
+                           method = "knn",
+                           preProcess = c("center", "scale"),
+                           tuneLength = 25,
+                           trControl = trainControl(method = "cv"))
+# Model Prediction
+x_hat_pre_knn_2 <- predict(elastic_model_knn_1, Y)
+x_hat_pre_knn_2
+  
+# Multiple R-squared
+rsq_knn_2 <- cor(X, x_hat_pre_knn_2)^2
+rsq_knn_2
+  
+# Plot
+plot(elastic_model_knn_2, main = "Knn2 Regression")
+
+map_knn2<-predict(covariates,elastic_model_knn_2)
+plot(map_knn2)
+
+```
+
+### rpart
+
+```{r}
+rpartFit <- train(CE_0_10+CE_10_30+CE_30_50 ~ .,
+                  data = cbind(X, Y),
+                  method = "rpart",
+                  tuneLength = 9)
+
+# Model Prediction
+x_hat_pre_rpart <- predict(rpartFit, Y)
+x_hat_pre_rpart
+  
+# Multiple R-squared
+rsq_rpart <- cor(X, x_hat_pre_rpart)^2
+rsq_rpart
+  
+# Plot
+plot(rpartFit, main = "rpart Regression")
+
+map_rpartFit<-predict(covariates,rpartFit)
+plot(map_rpartFit)
+
+```
+
+### lm
+
+```{r}
+lmFit <- train(CE_0_10+CE_10_30+CE_30_50 ~ .,
+               data = cbind(X, Y),
+               method = "lm")
+# Model Prediction
+x_hat_pre_lm <- predict(lmFit, Y)
+x_hat_pre_lm
+  
+# Multiple R-squared
+rsq_lm <- cor(X, x_hat_pre_lm)^2
+rsq_lm
+  
+# Plot
+plot(lmFit, main = "lm Regression")
+
+map_lmFit<-predict(covariates,lmFit)
+plot(map_lmFit)
+```
+
+### nnet
+
+```{r}
+nnetFit <- train(CE_0_10+CE_10_30+CE_30_50 ~ .,
+                 data = cbind(X, Y),
+                 method = "nnet",
+                 preProcess = "range",
+                 tuneLength = 2,
+                 trace = FALSE,
+                 maxit = 100)
+# Model Prediction
+x_hat_pre_nnet<- predict(nnetFit, Y)
+x_hat_pre_nnet
+  
+# Multiple R-squared
+rsq_nnet <- cor(X, x_hat_pre_nnet)^2
+rsq_nnet
+  
+# Plot
+plot(nnetFit, main = "nnet Regression")
+
+map_nnetFit<-predict(covariates,nnetFit)
+plot(map_nnetFit)
+```
+
+### Gradient Boosting with Component-wise Linear Models
+
+```{r}
+set.seed(1)
+usingMC <-  train(CE_0_10+CE_10_30+CE_30_50 ~ .,
+                  data = cbind(X, Y),
+                  method = "glmboost")
+
+# Model Prediction
+x_hat_pre_MC<- predict(usingMC, Y)
+x_hat_pre_MC
+  
+# Multiple R-squared
+rsq_MC <- cor(X, x_hat_pre_nnet)^2
+rsq_MC
+  
+# Plot
+plot(usingMC, main = "MC Regression")
+
+map_usingMC<-predict(covariates,usingMC)
+plot(map_usingMC)
+```
+
+### plsr
+
+```{r}
+test_plsr <-plsr(cbind(CE_0_10,CE_10_30,CE_30_50)  ~ CE_1_m+CE_0_5_m+SM_1_m+SM_0_5_m, ncomp=3,data=ce_train_norm, validation="LOO",method="oscorespls",na.action=na.exclude)
+
+summary(test_plsr)
+
+plot(test_plsr, plottype='validation')
+plot(test_plsr, plottype='prediction')
+plot(test_plsr, plottype='correlation')
+plot(test_plsr, plottype='biplot')
+
+## ----step_4 estimate goodness of fit 
+goof_plsr <- goof(ce_train_norm$CE_0_10, test_plsr$fitted.values[,,1])
+
+## ----step_6 fit a PLSR model; # LOO is leave one out.
+model_plsr <- plsr(cbind(CE_0_10,CE_10_30,CE_30_50) ~ CE_1_m+CE_0_5_m+SM_1_m+SM_0_5_m, ncomp=3,data=ce_train_norm, validation="LOO",method="oscorespls",na.action=na.exclude)
+
+summary(model_plsr)
+plot(model_plsr, plottype='validation')
+plot(model_plsr, plottype='prediction')
+
+## ----step_7, use PLSR to predict soil properties
+model_cal <- predict(model_plsr, ce_train_norm, comps=3)
+model_pred <- predict(model_plsr, ce_valid_norm, comps=3)
+
+plot(ce_valid_norm$CE_0_10, model_pred[,1], main='Observed vs Predicted new values')
+plot(ce_valid_norm$CE_10_30, model_pred[,2], main='Observed vs Predicted new values')
+plot(ce_valid_norm$CE_30_50, model_pred[,3], main='Observed vs Predicted new values')
+
+## ----step_8, get goof for predicted values
+goof_cal <- goof(cbind(ce_train_norm$CE_0_10,ce_train_norm$CE_10_30,ce_train_norm$CE_30_50), model_plsr$fitted.values[,,3])
+
+goof_pred <- goof(cbind(ce_train_norm$CE_0_10,ce_train_norm$CE_10_30,ce_train_norm$CE_30_50), model_pred[,3]) 
+
+names(goof_pred)<- c("R2","concordance.Y1","concordance.Y2","concordance.Y3","MSE","RMSE","bias")
+goof_final <- rbind(goof_cal, goof_pred)
+goof_final$dataset <- c("Calibration", 'Validation')
+plot(goof_final$R2)
+
+summary(goof_final)
+
+map_plsr<-predict(covariates,model_plsr)
+plot(map_plsr)
+
+```
+
